@@ -1,0 +1,6 @@
+## Append samples of your project ##
+resources:
+- smartlog_v1alpha1_alert.yaml
+- smartlog_v1alpha1_alertgroup.yaml
+- smartlog_v1alpha1_monitorpod.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
