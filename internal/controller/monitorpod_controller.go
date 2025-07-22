@@ -20,56 +20,49 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"html/template"
+	"net/http"
+	"reflect"
+	"regexp"
+	"sync"
+	"text/template"
+	"time"
+
+	smartlogv1alpha1 "github.com/gitlayzer/smart-log/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
-	"net/http"
-	"reflect"
-	"regexp"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sync"
-	"time"
-
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-
-	smartlogv1alpha1 "github.com/gitlayzer/smart-log/api/v1alpha1"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // MonitorPodReconciler reconciles a MonitorPod object
 type MonitorPodReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	// 将 Manager 注入到 Reconciler 中
+	Scheme  *runtime.Scheme
 	Manager *MonitorManager
 }
 
 // MonitorManager 负责管理所有 MonitorPod 的后台监控任务
 type MonitorManager struct {
-	// 用于保护并发访问 monitors map
-	mu sync.RWMutex
-	// 存储每个监控任务的 cancel 函数，key 是 "namespace/name"
+	mu       sync.RWMutex
 	monitors map[string]context.CancelFunc
-
-	// K8S 客户端
 	client.Client
-
-	// 用于获取日志流的 clientset
-	clientset *kubernetes.Clientset
-
-	// 频率限制器
+	clientset   *kubernetes.Clientset
 	rateLimiter *InMemoryRateLimiter
+	Scheme      *runtime.Scheme
 }
 
 // RateLimiterInfo 存储了单个规则的告警频率信息
@@ -101,72 +94,30 @@ func NewInMemoryRateLimiter() *InMemoryRateLimiter {
 	}
 }
 
-// Allow 检查是否允许发送告警
+// Allow 检查是否允许请求，如果允许则立即记录。这是一个原子操作。
 func (rl *InMemoryRateLimiter) Allow(key string, limit int, period time.Duration) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-
 	info, exists := rl.data[key]
-
-	// 检查周期是否已重置
 	if exists && time.Since(info.LastSentAt) > period {
-		// 如果超过了抑制周期，则删除旧记录，视为一次新请求
 		delete(rl.data, key)
 		exists = false
 	}
-
 	if !exists {
-		// 第一次或已重置，允许并记录
 		rl.data[key] = RateLimiterInfo{Count: 1, LastSentAt: time.Now()}
 		return true
 	}
-
-	// 检查是否已达到上限
 	if info.Count >= limit {
-		// 已达到上限，不允许
 		return false
 	}
-
-	// 未达到上限，允许，并增加计数
 	info.Count++
-	info.LastSentAt = time.Now() // 每次都更新时间戳
+	info.LastSentAt = time.Now()
 	rl.data[key] = info
 	return true
 }
 
-// IsThrottled 检查是否应该抑制告警
-func (rl *InMemoryRateLimiter) IsThrottled(key string, limit int, period time.Duration) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	info, exists := rl.data[key]
-	if !exists {
-		return false // 第一次，不抑制
-	}
-
-	// 如果上次发送时间已经超过了抑制周期，重置计数器
-	if time.Since(info.LastSentAt) > period {
-		delete(rl.data, key)
-		return false
-	}
-
-	// 检查是否达到次数上限
-	return info.Count >= limit
-}
-
-// Record 记录一次成功的告警发送
-func (rl *InMemoryRateLimiter) Record(key string) {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	info := rl.data[key]
-	info.Count++
-	info.LastSentAt = time.Now()
-	rl.data[key] = info
-}
-
 // NewMonitorManager 创建一个新的 Manager
-func NewMonitorManager(cli client.Client, cfg *rest.Config) (*MonitorManager, error) {
+func NewMonitorManager(cli client.Client, cfg *rest.Config, scheme *runtime.Scheme) (*MonitorManager, error) {
 	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -176,6 +127,7 @@ func NewMonitorManager(cli client.Client, cfg *rest.Config) (*MonitorManager, er
 		Client:      cli,
 		clientset:   clientset,
 		rateLimiter: NewInMemoryRateLimiter(),
+		Scheme:      scheme,
 	}, nil
 }
 
@@ -187,22 +139,13 @@ func NewMonitorManager(cli client.Client, cfg *rest.Config) (*MonitorManager, er
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=smartlog.smart-tools.com,resources=alerts,verbs=get;list;watch
 // +kubebuilder:rbac:groups=smartlog.smart-tools.com,resources=alertgroups,verbs=get;list;watch
+// +kubebuilder:rbac:groups=smartlog.smart-tools.com,resources=alertrecords,verbs=create
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the MonitorPod object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
+// Reconcile 函数处理 MonitorPod 的调谐
 func (r *MonitorPodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-
 	log.Info("--- Received reconcile request for MonitorPod ---", "request", req.NamespacedName)
 
-	// 1. 获取 MonitorPod 实例
 	var monitorPod smartlogv1alpha1.MonitorPod
 	if err := r.Get(ctx, req.NamespacedName, &monitorPod); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -214,11 +157,8 @@ func (r *MonitorPodReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	// 使用 defer 来确保无论函数如何退出，status 更新都会被尝试执行
-	// 先复制一份原始状态，避免在函数中意外修改
 	originalStatus := *monitorPod.Status.DeepCopy()
 	defer func() {
-		// 只有在 status 发生变化时才执行更新，避免不必要的 API 调用
 		if !reflect.DeepEqual(originalStatus, monitorPod.Status) {
 			log.Info("Updating MonitorPod status")
 			if err := r.Status().Update(ctx, &monitorPod); err != nil {
@@ -227,83 +167,54 @@ func (r *MonitorPodReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}()
 
-	// 2. 【新增】计算并更新可立即获得的状态
 	var podList corev1.PodList
 	selector, err := metav1.LabelSelectorAsSelector(&monitorPod.Spec.Selector)
 	if err != nil {
 		log.Error(err, "Invalid label selector in MonitorPod spec")
-		meta.SetStatusCondition(&monitorPod.Status.Conditions, metav1.Condition{
-			Type:    "Ready",
-			Status:  metav1.ConditionFalse,
-			Reason:  "InvalidSelector",
-			Message: err.Error(),
-		})
-		// 无需继续，defer 会处理 status 更新
+		meta.SetStatusCondition(&monitorPod.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "InvalidSelector", Message: err.Error()})
 		return ctrl.Result{}, nil
 	}
 
-	// 在 MonitorPod 所在的命名空间内查找匹配的 Pod
+	log.Info("Attempting to find pods with selector", "selector", selector.String())
+
 	if err := r.List(ctx, &podList, client.InNamespace(monitorPod.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
 		log.Error(err, "Failed to list pods for status update")
-		meta.SetStatusCondition(&monitorPod.Status.Conditions, metav1.Condition{
-			Type:    "Ready",
-			Status:  metav1.ConditionFalse,
-			Reason:  "ListPodsFailed",
-			Message: err.Error(),
-		})
-		return ctrl.Result{}, err // 返回 err 以便重试
+		meta.SetStatusCondition(&monitorPod.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "ListPodsFailed", Message: err.Error()})
+		return ctrl.Result{}, err
 	}
 
 	log.Info("Found matching pods", "count", len(podList.Items))
-
-	// <<< 将日志循环移动到这里 >>>
 	podNames := make([]string, 0, len(podList.Items))
 	for _, pod := range podList.Items {
 		log.Info("Matched pod details", "podName", pod.Name, "podNamespace", pod.Namespace)
 		podNames = append(podNames, pod.Name)
 	}
 
-	// 更新状态字段
 	monitorPod.Status.MonitoredPodsCount = len(podList.Items)
-
-	// 设置 Ready 状态
-	meta.SetStatusCondition(&monitorPod.Status.Conditions, metav1.Condition{
-		Type:    "Ready",
-		Status:  metav1.ConditionTrue,
-		Reason:  "SetupComplete",
-		Message: "MonitorPod is configured correctly and monitoring pods.",
-	})
-
-	// 3. 委托后台任务给 Manager
+	meta.SetStatusCondition(&monitorPod.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "SetupComplete", Message: "MonitorPod is configured correctly and monitoring pods."})
 	log.Info("Delegating to MonitorManager", "monitoredPodsCount", monitorPod.Status.MonitoredPodsCount)
 	r.Manager.StartOrUpdateMonitor(ctx, &monitorPod)
 
 	return ctrl.Result{}, nil
 }
 
-// StartOrUpdateMonitor 启动或更新指定命名空间下的指定名称的监控任务
+// StartOrUpdateMonitor 函数启动或更新监控
 func (m *MonitorManager) StartOrUpdateMonitor(ctx context.Context, mp *smartlogv1alpha1.MonitorPod) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	key := types.NamespacedName{Name: mp.Name, Namespace: mp.Namespace}.String()
-
 	if cancel, exists := m.monitors[key]; exists {
 		cancel()
 	}
-
-	// 从 Reconcile 传入的 ctx 创建子 context，这样 logger 等值就能被继承
-	monitorCtx, cancel := context.WithCancel(ctx) // <<< 修改这里！
-
+	monitorCtx, cancel := context.WithCancel(ctx)
 	m.monitors[key] = cancel
 	go m.runMonitorLoop(monitorCtx, mp)
 }
 
-// StopMonitor 停止指定命名空间下的指定名称的监控任务
+// StopMonitor 函数停止监控
 func (m *MonitorManager) StopMonitor(namespacedName types.NamespacedName) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	key := namespacedName.String()
 	if cancel, exists := m.monitors[key]; exists {
 		cancel()
@@ -311,23 +222,18 @@ func (m *MonitorManager) StopMonitor(namespacedName types.NamespacedName) {
 	}
 }
 
-// runMonitorLoop 是为单个 MonitorPod 资源运行的主循环
+// runMonitorLoop 函数运行监控循环
 func (m *MonitorManager) runMonitorLoop(ctx context.Context, mp *smartlogv1alpha1.MonitorPod) {
 	log := logf.FromContext(ctx).WithValues("MonitorPod", mp.Name)
 	log.Info("Starting monitor loop")
 	defer log.Info("Stopping monitor loop")
-
-	// 使用 Ticker 定期检查匹配的 Pods
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-
-	// 存储每个 Pod 的日志监听任务的 cancel 函数
 	activePodMonitors := make(map[string]context.CancelFunc)
 	var podMu sync.Mutex
-
 	for {
 		select {
-		case <-ctx.Done(): // MonitorPod 被删除或更新，退出主循环
+		case <-ctx.Done():
 			podMu.Lock()
 			for _, cancel := range activePodMonitors {
 				cancel()
@@ -335,21 +241,17 @@ func (m *MonitorManager) runMonitorLoop(ctx context.Context, mp *smartlogv1alpha
 			podMu.Unlock()
 			return
 		case <-ticker.C:
-			// --- 查找和同步 Pods ---
 			selector, err := metav1.LabelSelectorAsSelector(&mp.Spec.Selector)
 			if err != nil {
 				log.Error(err, "Invalid label selector")
 				continue
 			}
-
 			var podList corev1.PodList
 			if err := m.List(context.Background(), &podList, client.InNamespace(mp.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
 				log.Error(err, "Failed to list pods")
 				continue
 			}
-
 			podMu.Lock()
-
 			currentPods := make(map[string]struct{})
 			for _, pod := range podList.Items {
 				if pod.Status.Phase == corev1.PodRunning {
@@ -357,17 +259,13 @@ func (m *MonitorManager) runMonitorLoop(ctx context.Context, mp *smartlogv1alpha
 					currentPods[podKey] = struct{}{}
 				}
 			}
-
-			// 步骤 2: 清理不再存在的 Pod 的监控
 			for podKey, cancel := range activePodMonitors {
 				if _, exists := currentPods[podKey]; !exists {
 					log.Info("Stopping monitor for pod that no longer exists or matches", "podKey", podKey)
-					cancel()                          // 停止 goroutine
-					delete(activePodMonitors, podKey) // 从 map 中移除
+					cancel()
+					delete(activePodMonitors, podKey)
 				}
 			}
-
-			// (此处省略了复杂的 Pod 同步逻辑，简化为只为新 Pod 启动)
 			for _, pod := range podList.Items {
 				if pod.Status.Phase != corev1.PodRunning {
 					continue
@@ -377,7 +275,6 @@ func (m *MonitorManager) runMonitorLoop(ctx context.Context, mp *smartlogv1alpha
 					log.Info("Found new pod to monitor", "pod", pod.Name)
 					podCtx, podCancel := context.WithCancel(ctx)
 					activePodMonitors[podKey] = podCancel
-
 					go m.streamPodLogs(podCtx, mp, pod.DeepCopy())
 				}
 			}
@@ -386,51 +283,91 @@ func (m *MonitorManager) runMonitorLoop(ctx context.Context, mp *smartlogv1alpha
 	}
 }
 
-// streamPodLogs 监听单个 Pod 的日志流
+// streamPodLogs 函数处理日志流
 func (m *MonitorManager) streamPodLogs(ctx context.Context, mp *smartlogv1alpha1.MonitorPod, pod *corev1.Pod) {
 	log := logf.FromContext(ctx).WithValues("Pod", pod.Name)
-	log.Info("Starting log stream")
+	log.Info("Starting log stream with multiline support")
 	defer log.Info("Closing log stream")
-
-	// (此处省略了处理多容器的逻辑，简化为第一个容器)
+	var multilineRegex *regexp.Regexp
+	var err error
+	if mp.Spec.Multiline != nil {
+		multilineRegex, err = regexp.Compile(mp.Spec.Multiline.Pattern)
+		if err != nil {
+			log.Error(err, "Invalid multiline regex pattern, falling back to single-line mode")
+			multilineRegex = nil
+		}
+	}
 	containerName := pod.Spec.Containers[0].Name
-
-	req := m.clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-		Container: containerName,
-		Follow:    true,
-	})
-
+	req := m.clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{Container: containerName, Follow: true})
 	stream, err := req.Stream(ctx)
 	if err != nil {
 		log.Error(err, "Failed to open log stream")
 		return
 	}
 	defer stream.Close()
-
 	scanner := bufio.NewScanner(stream)
-	for scanner.Scan() {
-		logLine := scanner.Text()
-
-		for _, rule := range mp.Spec.Rules {
-			matched, _ := regexp.MatchString(rule.Regex, logLine)
-			if matched {
-				log.Info("Log line matched rule", "rule", rule.Name, "log", logLine)
-
-				// 在独立的 goroutine 中发送告警，避免阻塞日志读取
-				go m.dispatchAlert(ctx, mp, pod, logLine, rule, containerName) // <<< 修改这里！
-				break                                                          // 一行日志只匹配第一个规则
+	var buffer bytes.Buffer
+	flushTimer := time.NewTimer(500 * time.Millisecond)
+	flushTimer.Stop()
+	processBuffer := func() {
+		if buffer.Len() > 0 {
+			fullLogEvent := buffer.String()
+			for _, rule := range mp.Spec.Rules {
+				matched, _ := regexp.MatchString(rule.Regex, fullLogEvent)
+				if matched {
+					log.Info("Multiline log event matched rule", "rule", rule.Name)
+					go m.dispatchAlert(ctx, mp, pod, fullLogEvent, rule, containerName)
+					break
+				}
 			}
+			buffer.Reset()
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			processBuffer()
+			log.Info("Log stream context done, shutting down.")
+			return
+		case <-flushTimer.C:
+			log.Info("Multiline buffer flushed due to timeout")
+			processBuffer()
+		default:
+			if !scanner.Scan() {
+				processBuffer()
+				if err := scanner.Err(); err != nil {
+					if errors.Is(err, context.Canceled) {
+						log.Info("Log stream scanner stopped due to context cancellation (expected behavior).")
+					} else {
+						log.Error(err, "Error reading from log stream")
+					}
+				}
+				return
+			}
+			line := scanner.Text()
+			if multilineRegex == nil {
+				buffer.WriteString(line)
+				processBuffer()
+				continue
+			}
+			isMatch := multilineRegex.MatchString(line)
+			isNewEvent := (isMatch != mp.Spec.Multiline.Negate)
+			if isNewEvent {
+				processBuffer()
+			}
+			if buffer.Len() > 0 {
+				buffer.WriteString("\n")
+			}
+			buffer.WriteString(line)
+			flushTimer.Reset(500 * time.Millisecond)
 		}
 	}
 }
 
-// dispatchAlert 负责执行最终的告警发送
-// dispatchAlert 负责执行最终的告警发送和状态更新 (最终完整版 - 包含模板优先级和频率限制)
+// dispatchAlert 函数处理告警
 func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1.MonitorPod, pod *corev1.Pod, logLine string, rule smartlogv1alpha1.LogRule, containerName string) {
-	// 为本次派发任务创建一个基础的、带上下文信息的 logger
 	baseLog := logf.FromContext(ctx).WithValues("MonitorPod", mp.Name, "Pod", pod.Name, "Rule", rule.Name)
 
-	// --- 步骤 1: 频率限制检查与记录 (原子操作) ---
 	if mp.Spec.RateLimit != nil && mp.Spec.RateLimit.Limit > 0 {
 		rateLimitKey := fmt.Sprintf("%s/%s/%s", mp.Namespace, mp.Name, rule.Name)
 		period, err := time.ParseDuration(mp.Spec.RateLimit.Period)
@@ -438,8 +375,6 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 			baseLog.Error(err, "无效的频率限制周期格式，使用默认值 5m")
 			period = 5 * time.Minute
 		}
-
-		// 调用 Allow()，它会原子地完成检查和记录
 		if !m.rateLimiter.Allow(rateLimitKey, mp.Spec.RateLimit.Limit, period) {
 			baseLog.Info("告警已被频率限制器抑制")
 			return
@@ -447,7 +382,6 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 		baseLog.Info("频率限制检查通过，准备发送告警")
 	}
 
-	// --- 步骤 2: 获取所有有效的告警渠道配置 ---
 	alerts, err := m.getAlertsFromTarget(ctx, &mp.Spec.AlertTarget, mp.Namespace)
 	if err != nil {
 		baseLog.Error(err, "获取告警渠道配置失败")
@@ -458,48 +392,42 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 		return
 	}
 
-	// --- 步骤 3: 准备模板数据 (只需准备一次) ---
+	escapedLogLineBytes, _ := json.Marshal(logLine)
+	escapedLogLine := string(escapedLogLineBytes[1 : len(escapedLogLineBytes)-1])
+
 	templateData := TemplateData{
 		PodName:       pod.Name,
 		Namespace:     pod.Namespace,
 		ContainerName: containerName,
-		LogLine:       logLine,
+		LogLine:       escapedLogLine,
 		RuleName:      rule.Name,
 		Timestamp:     time.Now(),
 	}
 
-	// --- 步骤 4: 并发发送告警到所有渠道 ---
 	var wg sync.WaitGroup
 	successCh := make(chan bool, len(alerts))
 
 	for _, alert := range alerts {
 		wg.Add(1)
 		go func(alertConf smartlogv1alpha1.Alert) {
+			// ... (发送告警的 goroutine 内部逻辑不变) ...
 			defer wg.Done()
 			alertLog := baseLog.WithValues("alert", alertConf.Name)
-
-			// --- 【核心修改】模板优先级选择逻辑 ---
-			templateStr := mp.Spec.AlertTemplate // 默认使用 MonitorPod 的模板
+			templateStr := mp.Spec.AlertTemplate
 			if templateStr == "" && alertConf.Spec.Webhook != nil && alertConf.Spec.Webhook.BodyTemplate != "" {
-				// 如果 MonitorPod 模板为空，则回退到 Alert 的模板
 				alertLog.Info("MonitorPod 模板为空，回退到 Alert 的 bodyTemplate")
 				templateStr = alertConf.Spec.Webhook.BodyTemplate
 			}
-
-			// --- 渲染最终选择的模板 ---
 			messageBody, err := m.renderAlertTemplate(templateStr, templateData)
 			if err != nil {
 				alertLog.Error(err, "渲染告警模板失败")
 				return
 			}
-
-			// 安全检查，确保 webhook 配置存在
+			alertLog.Info("即将发送到 Webhook 的最终载荷", "payload", string(messageBody))
 			if alertConf.Spec.Webhook == nil {
-				alertLog.Error(fmt.Errorf("webhook spec is nil for alert"), "Webhook 配置缺失")
+				alertLog.Error(fmt.Errorf("webhook spec is nil"), "Webhook 配置缺失")
 				return
 			}
-
-			// 从 Secret 中获取 Webhook URL
 			var secret corev1.Secret
 			secretKey := types.NamespacedName{Name: alertConf.Spec.Webhook.URLSecretRef.Name, Namespace: alertConf.Namespace}
 			if err := m.Get(ctx, secretKey, &secret); err != nil {
@@ -512,24 +440,17 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 				return
 			}
 			webhookURL := string(webhookURLBytes)
-
-			// 为 HTTP 请求创建独立的、带超时的上下文
 			reqCtx, cancelReq := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancelReq()
-
 			req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, webhookURL, bytes.NewBuffer(messageBody))
 			if err != nil {
 				alertLog.Error(err, "创建 HTTP 请求失败")
 				return
 			}
-
-			// 添加自定义 Headers
 			req.Header.Set("Content-Type", "application/json")
 			for _, header := range alertConf.Spec.Webhook.Headers {
 				req.Header.Set(header.Name, header.Value)
 			}
-
-			// 发送请求
 			httpClient := &http.Client{}
 			resp, err := httpClient.Do(req)
 			if err != nil {
@@ -537,14 +458,10 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 				return
 			}
 			defer resp.Body.Close()
-
-			// 检查响应状态码
 			if resp.StatusCode >= 400 {
-				err = fmt.Errorf("Webhook 服务端返回错误状态码: %s", resp.Status)
-				alertLog.Error(err, "Webhook 发送失败")
+				alertLog.Error(fmt.Errorf("Webhook 服务端返回错误状态码: %s", resp.Status), "Webhook 发送失败")
 				return
 			}
-
 			alertLog.Info("成功发送通知")
 			successCh <- true
 		}(alert)
@@ -553,8 +470,39 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 	wg.Wait()
 	close(successCh)
 
-	// --- 步骤 5: 根据发送结果更新状态 ---
 	if len(successCh) > 0 {
+		if mp.Spec.RecordAlerts {
+			baseLog.Info("RecordAlerts 已启用，正在创建 AlertRecord...")
+			alertRecord := &smartlogv1alpha1.AlertRecord{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: fmt.Sprintf("%s-%s-", mp.Name, rule.Name),
+					Namespace:    mp.Namespace,
+					Labels: map[string]string{
+						"smartlog.smart-tools.com/monitorpod": mp.Name,
+						"smartlog.smart-tools.com/rule":       rule.Name,
+					},
+				},
+				Spec: smartlogv1alpha1.AlertRecordSpec{
+					MonitorPodRef: smartlogv1alpha1.MonitorPodReference{Name: mp.Name, Namespace: mp.Namespace},
+					RuleName:      rule.Name,
+					TriggeredAt:   metav1.Now(),
+					SourcePod:     smartlogv1alpha1.PodReference{Name: pod.Name, Namespace: pod.Namespace, Container: containerName},
+					LogSnippet:    logLine,
+				},
+			}
+			if mp.Spec.AlertRecordTTL != "" {
+				alertRecord.Annotations = map[string]string{"smartlog.smart-tools.com/ttl": mp.Spec.AlertRecordTTL}
+			}
+			if err := ctrl.SetControllerReference(mp, alertRecord, m.Scheme); err != nil {
+				baseLog.Error(err, "设置 AlertRecord 的 Owner Reference 失败")
+			} else {
+				if err := m.Create(context.Background(), alertRecord); err != nil {
+					baseLog.Error(err, "创建 AlertRecord 失败")
+				} else {
+					baseLog.Info("成功创建 AlertRecord", "AlertRecordName", alertRecord.Name)
+				}
+			}
+		}
 		namespacedName := types.NamespacedName{Name: mp.Name, Namespace: mp.Namespace}
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			updateCtx := context.Background()
@@ -562,14 +510,11 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 			if errGet := m.Get(updateCtx, namespacedName, &latestMonitorPod); errGet != nil {
 				return errGet
 			}
-
 			latestMonitorPod.Status.AlertsSentCount++
 			now := metav1.Now()
 			latestMonitorPod.Status.LastTriggeredTime = &now
-
 			return m.Status().Update(updateCtx, &latestMonitorPod)
 		})
-
 		if err != nil {
 			baseLog.Error(err, "发送告警后更新 MonitorPod 状态失败")
 		} else {
@@ -578,7 +523,7 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 	}
 }
 
-// getAlertsFromTarget 根据 AlertTarget 获取所有有效的 Alert 资源
+// getAlertsFromTarget 获取指定目标下的所有已就绪的告警
 func (m *MonitorManager) getAlertsFromTarget(ctx context.Context, target *smartlogv1alpha1.AlertTarget, namespace string) ([]smartlogv1alpha1.Alert, error) {
 	readyAlerts := make([]smartlogv1alpha1.Alert, 0)
 
@@ -588,7 +533,7 @@ func (m *MonitorManager) getAlertsFromTarget(ctx context.Context, target *smartl
 		if err := m.Get(ctx, key, &alert); err != nil {
 			return nil, err
 		}
-		if alert.Status.Ready {
+		if meta.IsStatusConditionTrue(alert.Status.Conditions, "Ready") {
 			readyAlerts = append(readyAlerts, alert)
 		}
 	} else if target.Kind == "AlertGroup" {
@@ -601,10 +546,9 @@ func (m *MonitorManager) getAlertsFromTarget(ctx context.Context, target *smartl
 			var alert smartlogv1alpha1.Alert
 			alertKey := types.NamespacedName{Name: alertName, Namespace: namespace}
 			if err := m.Get(ctx, alertKey, &alert); err != nil {
-				// 组内某个成员获取失败，可以记录日志后跳过
 				continue
 			}
-			if alert.Status.Ready {
+			if meta.IsStatusConditionTrue(alert.Status.Conditions, "Ready") {
 				readyAlerts = append(readyAlerts, alert)
 			}
 		}
@@ -615,11 +559,25 @@ func (m *MonitorManager) getAlertsFromTarget(ctx context.Context, target *smartl
 	return readyAlerts, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// renderAlertTemplate 渲染告警模板
+func (m *MonitorManager) renderAlertTemplate(templateStr string, data TemplateData) ([]byte, error) {
+	if templateStr == "" {
+		templateStr = `{"pod":"{{.PodName}}","namespace":"{{.Namespace}}","container":"{{.ContainerName}}","rule":"{{.RuleName}}","log":"{{.LogLine}}","timestamp":"{{.Timestamp.Format "2006-01-02T15:04:05Z07:00"}}"}`
+	}
+	tmpl, err := template.New("alert").Parse(templateStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse alert template: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return nil, fmt.Errorf("failed to execute alert template: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
 func (r *MonitorPodReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&smartlogv1alpha1.MonitorPod{}).
-		Named("monitorpod").
 		Watches(
 			&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(r.findMonitorPodsForPod),
@@ -627,60 +585,21 @@ func (r *MonitorPodReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// renderAlertTemplate 渲染告警消息模板
-func (m *MonitorManager) renderAlertTemplate(templateStr string, data TemplateData) ([]byte, error) {
-	if templateStr == "" {
-		// 如果模板为空，提供一个默认的 JSON 模板
-		templateStr = `{
-			"pod": "{{.PodName}}",
-			"namespace": "{{.Namespace}}",
-			"container": "{{.ContainerName}}",
-			"rule": "{{.RuleName}}",
-			"log": "{{.LogLine}}",
-			"timestamp": "{{.Timestamp.Format "2006-01-02T15:04:05Z07:00"}}"
-		}`
-	}
-
-	tmpl, err := template.New("alert").Parse(templateStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse alert template: %w", err)
-	}
-
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
-		return nil, fmt.Errorf("failed to execute alert template: %w", err)
-	}
-
-	return buf.Bytes(), nil
-}
-
-// findMonitorPodsForPod 是一个 MapFunc，用于找到所有可能匹配给定 Pod 的 MonitorPod。
 func (r *MonitorPodReconciler) findMonitorPodsForPod(ctx context.Context, podObj client.Object) []reconcile.Request {
 	pod, ok := podObj.(*corev1.Pod)
 	if !ok {
 		return []reconcile.Request{}
 	}
-
 	var monitorPods smartlogv1alpha1.MonitorPodList
-
-	// 【修复】只在 Pod 所在的命名空间内查找 MonitorPod
-	// 这样 List 操作就不会因为权限问题而失败
 	if err := r.List(ctx, &monitorPods, client.InNamespace(pod.GetNamespace())); err != nil {
-		// 如果 listing 失败，暂时返回空，避免卡死队列
-		// 可以在这里加一行日志来观察错误
-		// log.FromContext(ctx).Error(err, "failed to list monitorpods for pod watch")
 		return []reconcile.Request{}
 	}
-
 	requests := make([]reconcile.Request, 0)
 	for _, mp := range monitorPods.Items {
-		// 无需再检查 namespace，因为 List 的时候已经限定了
-
 		selector, err := metav1.LabelSelectorAsSelector(&mp.Spec.Selector)
 		if err != nil {
 			continue
 		}
-
 		if selector.Matches(labels.Set(pod.Labels)) {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
@@ -690,6 +609,5 @@ func (r *MonitorPodReconciler) findMonitorPodsForPod(ctx context.Context, podObj
 			})
 		}
 	}
-
 	return requests
 }

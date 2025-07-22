@@ -21,24 +21,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // AlertSpec defines the desired state of Alert
 type AlertSpec struct {
-	// Type 是配置此次告警的渠道, 告警渠道都有: WeChat, DingTalk, Webhook, Email
+	// Type 指定了告警渠道的类型。
+	// 当前版本仅支持 "Webhook"。
+	// +kubebuilder:validation:Enum=Webhook
 	Type string `json:"type"`
 
-	// 第一版当前仅支持 WebHook
+	// Webhook 的详细配置, 仅当 Type 为 "Webhook" 时有效。
+	// +optional
 	Webhook *WebhookSpec `json:"webhook,omitempty"`
 }
 
+// WebhookSpec 定义了发送到 Webhook 所需的配置。
 type WebhookSpec struct {
-	// 获取告警渠道的 URL
+	// URLSecretRef 引用一个包含 Webhook URL 的 Secret。
 	URLSecretRef corev1.SecretKeySelector `json:"urlSecretRef"`
-	// 可以选择自定义 header
+	// Headers (可选) 发送到 Webhook 的自定义 HTTP 请求头。
+	// +optional
 	Headers []WebhookHeader `json:"headers,omitempty"`
-	// 定义告警模板
+	// BodyTemplate (可选) 告警内容的 Go 模板, 作为渠道的默认格式。
+	// +optional
 	BodyTemplate string `json:"bodyTemplate,omitempty"`
 }
 
@@ -50,18 +53,18 @@ type WebhookHeader struct {
 
 // AlertStatus defines the observed state of Alert.
 type AlertStatus struct {
-	// Ready 表示该 Alert 配置是否经过验证且可用
-	Ready bool `json:"ready"`
-	// Conditions 存储了当前资源的状态信息
+	// Conditions 存储了资源的详细状态列表，例如 Ready 状态。
+	// 这是表达资源状态的标准方式。
+	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:path=alerts,scope=Namespaced,shortName=alt
-// +kubebuilder:printcolumn:name="Ready",type="boolean",JSONPath=".status.ready",description="The readiness of the Alert"
-// +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="The status of the Alert"
-// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="The age of the Alert"
+// +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="表示该告警渠道是否就绪"
+// +kubebuilder:printcolumn:name="Type",type="string",JSONPath=".spec.type",description="告警渠道的类型"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // Alert is the Schema for the alerts API
 type Alert struct {

@@ -5,6 +5,22 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - pods
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/log
+  verbs:
+  - get
+  - watch
+- apiGroups:
   - smartlog.smart-tools.com
   resources:
   - alertgroups
@@ -36,3 +52,12 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - smartlog.smart-tools.com
+  resources:
+  - alertrecords
+  verbs:
+  - create
+  - delete
+  - list
+  - watch

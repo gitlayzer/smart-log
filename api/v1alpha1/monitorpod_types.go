@@ -42,6 +42,32 @@ type MonitorPodSpec struct {
 
 	// RateLimit 用于限制发送的告警数量
 	RateLimit *RateLimitSpec `json:"rateLimit,omitempty"`
+
+	// Multiline 用于处理多行日志
+	Multiline *MultilineSpec `json:"multiline,omitempty"`
+
+	// RecordAlerts 控制是否为触发的告警创建 AlertRecord 资源。
+	// 默认为 false。
+	// +optional
+	RecordAlerts bool `json:"recordAlerts,omitempty"`
+
+	// AlertRecordTTL 定义了创建的 AlertRecord 资源的存活时间 (Time-To-Live)。
+	// 例如 "720h" (30天), "168h" (7天)。
+	// 只有在 recordAlerts 为 true 时才有效。
+	// +optional
+	AlertRecordTTL string `json:"alertRecordTTL,omitempty"`
+}
+
+// MultilineSpec 定义了如何将多行日志合并成一个单一事件。
+type MultilineSpec struct {
+	// Pattern 是一个正则表达式，用于标识一个日志行的归属。
+	// 它通常用于匹配一个新日志事件的起始行。
+	Pattern string `json:"pattern"`
+
+	// Negate 控制 Pattern 的匹配行为。
+	// - false (默认): 匹配 Pattern 的行被视为【新事件的开始】。
+	// - true: 不匹配 Pattern 的行被视为【新事件的开始】。
+	Negate bool `json:"negate,omitempty"`
 }
 
 type LogRule struct {
@@ -55,6 +81,7 @@ type LogRule struct {
 
 type AlertTarget struct {
 	// Kind 用于指定目标类型，可以是 "Alert" 或 "AlertGroup"
+	// +kubebuilder:validation:Enum=Alert;AlertGroup
 	Kind string `json:"kind"`
 	// Name 用于指定目标名称
 	Name string `json:"name"`
@@ -81,13 +108,15 @@ type MonitorPodStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-// +kubebuilder:object:root=true
-// +kubebuilder:subresource:status
-// +kubebuilder:resource:path=monitorpods,scope=Namespaced,shortName=mp
-// +kubebuilder:printcolumn:name="MonitoredPodsCount",type="integer",JSONPath=".status.monitoredPodsCount",description="The number of pods currently being monitored"
-// +kubebuilder:printcolumn:name="AlertsSentCount",type="integer",JSONPath=".status.alertsSentCount",description="Total number of alerts sent"
-// +kubebuilder:printcolumn:name="LastTriggeredTime",type="date",JSONPath=".status.lastTriggeredTime",description="The last time an alert was triggered"
-// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Age of the object"
+// --- 【核心修复】所有 CRD 级别的注解都必须写在这里 ---
+//+kubebuilder:object:root=true
+//+kubebuilder:subresource:status
+//+kubebuilder:resource:path=monitorpods,shortName=mp,scope=Namespaced
+//+kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="表示 MonitorPod 配置是否就绪"
+//+kubebuilder:printcolumn:name="Monitored",type="integer",JSONPath=".status.monitoredPodsCount",description="当前监控的 Pod 数量"
+//+kubebuilder:printcolumn:name="Alerts Sent",type="integer",JSONPath=".status.alertsSentCount",description="已发送的告警总数"
+//+kubebuilder:printcolumn:name="Last Alert",type="date",JSONPath=".status.lastTriggeredTime",description="最近一次告警时间"
+//+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // MonitorPod is the Schema for the monitorpods API
 type MonitorPod struct {

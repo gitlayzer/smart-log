@@ -3,4 +3,5 @@ resources:
 - smartlog_v1alpha1_alert.yaml
 - smartlog_v1alpha1_alertgroup.yaml
 - smartlog_v1alpha1_monitorpod.yaml
+- smartlog_v1alpha1_alertrecord.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

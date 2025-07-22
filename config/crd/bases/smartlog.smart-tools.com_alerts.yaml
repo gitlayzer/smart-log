@@ -11,10 +11,24 @@ spec:
     kind: Alert
     listKind: AlertList
     plural: alerts
+    shortNames:
+    - alt
     singular: alert
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - description: 表示该告警渠道是否就绪
+      jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - description: 告警渠道的类型
+      jsonPath: .spec.type
+      name: Type
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Alert is the Schema for the alerts API
@@ -39,13 +53,125 @@ spec:
           spec:
             description: spec defines the desired state of Alert
             properties:
-              foo:
-                description: foo is an example field of Alert. Edit alert_types.go
-                  to remove/update
+              type:
+                description: |-
+                  Type 指定了告警渠道的类型。
+                  当前版本仅支持 "Webhook"。
+                enum:
+                - Webhook
                 type: string
+              webhook:
+                description: Webhook 的详细配置, 仅当 Type 为 "Webhook" 时有效。
+                properties:
+                  bodyTemplate:
+                    description: BodyTemplate (可选) 告警内容的 Go 模板, 作为渠道的默认格式。
+                    type: string
+                  headers:
+                    description: Headers (可选) 发送到 Webhook 的自定义 HTTP 请求头。
+                    items:
+                      description: WebhookHeader 定义了要发送的自定义 HTTP 请求头。
+                      properties:
+                        name:
+                          type: string
+                        value:
+                          type: string
+                      required:
+                      - name
+                      - value
+                      type: object
+                    type: array
+                  urlSecretRef:
+                    description: URLSecretRef 引用一个包含 Webhook URL 的 Secret。
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - urlSecretRef
+                type: object
+            required:
+            - type
             type: object
           status:
             description: status defines the observed state of Alert
+            properties:
+              conditions:
+                description: |-
+                  Conditions 存储了资源的详细状态列表，例如 Ready 状态。
+                  这是表达资源状态的标准方式。
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
             type: object
         required:
         - spec

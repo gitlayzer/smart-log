@@ -36,4 +36,12 @@ resources:
   kind: MonitorPod
   path: github.com/gitlayzer/smart-log/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: smart-tools.com
+  group: smartlog
+  kind: AlertRecord
+  path: github.com/gitlayzer/smart-log/api/v1alpha1
+  version: v1alpha1
 version: "3"

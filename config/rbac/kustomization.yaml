@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the smart-log itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- alertrecord_admin_role.yaml
+- alertrecord_editor_role.yaml
+- alertrecord_viewer_role.yaml
 - monitorpod_admin_role.yaml
 - monitorpod_editor_role.yaml
 - monitorpod_viewer_role.yaml
