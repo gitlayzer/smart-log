@@ -53,12 +53,65 @@ spec:
           spec:
             description: spec defines the desired state of Alert
             properties:
+              feishu:
+                description: Feishu 的详细配置, 仅当 Type 为 "Feishu" 时有效。
+                properties:
+                  secretKeySecretRef:
+                    description: SecretKeySecretRef (可选) 引用一个包含加签密钥的 Secret，用于安全校验。
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  urlSecretRef:
+                    description: URLSecretRef 引用一个包含飞书机器人 Webhook URL 的 Secret。
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - urlSecretRef
+                type: object
               type:
-                description: |-
-                  Type 指定了告警渠道的类型。
-                  当前版本仅支持 "Webhook"。
+                description: Type 指定了告警渠道的类型。
                 enum:
                 - Webhook
+                - Feishu
                 type: string
               webhook:
                 description: Webhook 的详细配置, 仅当 Type 为 "Webhook" 时有效。

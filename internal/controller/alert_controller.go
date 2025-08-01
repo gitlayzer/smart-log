@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-
 	smartlogv1alpha1 "github.com/gitlayzer/smart-log/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -27,6 +26,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
+	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -48,79 +49,94 @@ type AlertReconciler struct {
 func (r *AlertReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	var alert smartlogv1alpha1.Alert
-	if err := r.Get(ctx, req.NamespacedName, &alert); err != nil {
-		if apierrors.IsNotFound(err) {
-			logger.Info("Alert resource not found. Ignoring since object must be deleted")
-			return ctrl.Result{}, nil
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var alert smartlogv1alpha1.Alert
+		if err := r.Get(ctx, req.NamespacedName, &alert); err != nil {
+			// 如果在重试期间对象被删除，这里会返回 NotFound 错误，并停止重试
+			if apierrors.IsNotFound(err) {
+				logger.Info("Alert resource not found during status update. Ignoring.")
+				return nil
+			}
+			return err
 		}
-		logger.Error(err, "Failed to get Alert")
+
+		// 深度复制一份原始状态，用于后续比较
+		originalStatus := alert.Status.DeepCopy()
+
+		// 在最新对象上计算和设置状态
+		isValid, validationErr := r.validateAlert(ctx, &alert)
+		readyCondition := metav1.Condition{
+			Type: "Ready",
+		}
+		if isValid {
+			readyCondition.Status = metav1.ConditionTrue
+			readyCondition.Reason = "ValidationSucceeded"
+			readyCondition.Message = "Alert configuration is valid"
+		} else {
+			readyCondition.Status = metav1.ConditionFalse
+			readyCondition.Reason = "ValidationFailed"
+			readyCondition.Message = validationErr.Error()
+		}
+		meta.SetStatusCondition(&alert.Status.Conditions, readyCondition)
+
+		// 只有在状态发生有意义的变化时才更新
+		if reflect.DeepEqual(originalStatus, &alert.Status) {
+			return nil
+		}
+
+		return r.Status().Update(ctx, &alert)
+	})
+
+	if err != nil {
+		logger.Error(err, "Failed to update Alert status after multiple retries")
 		return ctrl.Result{}, err
 	}
 
-	isValid, validationErr := r.validateAlert(ctx, &alert)
-
-	readyCondition := metav1.Condition{
-		Type:    "Ready",
-		Status:  metav1.ConditionUnknown,
-		Reason:  "Validating",
-		Message: "Validating alert configuration",
-	}
-
-	if isValid {
-		readyCondition.Status = metav1.ConditionTrue
-		readyCondition.Reason = "ValidationSucceeded"
-		readyCondition.Message = "Alert configuration is valid"
-	} else {
-		readyCondition.Status = metav1.ConditionFalse
-		readyCondition.Reason = "ValidationFailed"
-		readyCondition.Message = validationErr.Error()
-	}
-
-	meta.SetStatusCondition(&alert.Status.Conditions, readyCondition)
-
-	if err := r.Status().Update(ctx, &alert); err != nil {
-		logger.Error(err, "Failed to update Alert status")
-		return ctrl.Result{}, err
-	}
-
-	logger.Info("Successfully reconciled Alert status", "Ready", isValid)
 	return ctrl.Result{}, nil
 }
 
 func (r *AlertReconciler) validateAlert(ctx context.Context, alert *smartlogv1alpha1.Alert) (bool, error) {
-	logger := log.FromContext(ctx)
-
-	if alert.Spec.Type != "Webhook" {
+	switch alert.Spec.Type {
+	case "Webhook":
+		if alert.Spec.Webhook == nil {
+			return false, fmt.Errorf("webhook spec is not defined for alert type Webhook")
+		}
+		return r.validateSecretRef(ctx, alert.Namespace, &alert.Spec.Webhook.URLSecretRef)
+	case "Feishu":
+		if alert.Spec.Feishu == nil {
+			return false, fmt.Errorf("feishu spec is not defined for alert type Feishu")
+		}
+		// 验证主 Webhook URL
+		valid, err := r.validateSecretRef(ctx, alert.Namespace, &alert.Spec.Feishu.URLSecretRef)
+		if !valid {
+			return false, err
+		}
+		// 如果配置了加签密钥，也需要验证
+		if alert.Spec.Feishu.SecretKeySecretRef != nil {
+			return r.validateSecretRef(ctx, alert.Namespace, alert.Spec.Feishu.SecretKeySecretRef)
+		}
+		return true, nil
+	default:
 		return false, fmt.Errorf("unsupported alert type: %s", alert.Spec.Type)
 	}
+}
 
-	if alert.Spec.Webhook == nil {
-		return false, fmt.Errorf("webhook spec is not defined for alert type Webhook")
-	}
-
-	webhookSpec := alert.Spec.Webhook
-	secretName := webhookSpec.URLSecretRef.Name
-	secretKey := webhookSpec.URLSecretRef.Key
-	secretNamespace := alert.Namespace
-
+func (r *AlertReconciler) validateSecretRef(ctx context.Context, namespace string, selector *corev1.SecretKeySelector) (bool, error) {
+	logger := log.FromContext(ctx)
 	var secret corev1.Secret
-	secretObjectKey := types.NamespacedName{Namespace: secretNamespace, Name: secretName}
+	secretKey := types.NamespacedName{Namespace: namespace, Name: selector.Name}
 
-	if err := r.Get(ctx, secretObjectKey, &secret); err != nil {
+	if err := r.Get(ctx, secretKey, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("Referenced secret not found", "secret", secretObjectKey.String())
-			return false, fmt.Errorf("referenced secret '%s' not found in namespace '%s'", secretName, secretNamespace)
+			return false, fmt.Errorf("referenced secret '%s' not found", selector.Name)
 		}
-		logger.Error(err, "Failed to get referenced secret")
-		return false, fmt.Errorf("failed to get referenced secret '%s': %w", secretName, err)
+		return false, fmt.Errorf("failed to get referenced secret '%s': %w", selector.Name, err)
 	}
 
-	if _, ok := secret.Data[secretKey]; !ok {
-		logger.Info("Key not found in referenced secret", "key", secretKey)
-		return false, fmt.Errorf("key '%s' not found in secret '%s'", secretKey, secretName)
+	if _, ok := secret.Data[selector.Key]; !ok {
+		logger.Info("Key not found in referenced secret", "key", selector.Key)
+		return false, fmt.Errorf("key '%s' not found in secret '%s'", selector.Key, selector.Name)
 	}
-
 	return true, nil
 }
 
@@ -139,10 +155,11 @@ func (r *AlertReconciler) findAlertsForSecret(ctx context.Context, secret client
 	if err := r.List(ctx, &alerts, client.InNamespace(secret.GetNamespace())); err != nil {
 		return []reconcile.Request{}
 	}
-
 	requests := make([]reconcile.Request, 0)
 	for _, alert := range alerts.Items {
-		if alert.Spec.Webhook != nil && alert.Spec.Webhook.URLSecretRef.Name == secret.GetName() {
+		if (alert.Spec.Webhook != nil && alert.Spec.Webhook.URLSecretRef.Name == secret.GetName()) ||
+			(alert.Spec.Feishu != nil && alert.Spec.Feishu.URLSecretRef.Name == secret.GetName()) ||
+			(alert.Spec.Feishu != nil && alert.Spec.Feishu.SecretKeySecretRef != nil && alert.Spec.Feishu.SecretKeySecretRef.Name == secret.GetName()) {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      alert.Name,

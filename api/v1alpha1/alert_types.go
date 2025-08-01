@@ -24,13 +24,16 @@ import (
 // AlertSpec defines the desired state of Alert
 type AlertSpec struct {
 	// Type 指定了告警渠道的类型。
-	// 当前版本仅支持 "Webhook"。
-	// +kubebuilder:validation:Enum=Webhook
+	// +kubebuilder:validation:Enum=Webhook;Feishu
 	Type string `json:"type"`
 
 	// Webhook 的详细配置, 仅当 Type 为 "Webhook" 时有效。
 	// +optional
 	Webhook *WebhookSpec `json:"webhook,omitempty"`
+
+	// Feishu 的详细配置, 仅当 Type 为 "Feishu" 时有效。
+	// +optional
+	Feishu *FeishuSpec `json:"feishu,omitempty"`
 }
 
 // WebhookSpec 定义了发送到 Webhook 所需的配置。
@@ -49,6 +52,15 @@ type WebhookSpec struct {
 type WebhookHeader struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
+}
+
+// FeishuSpec 定义了发送到飞书机器人所需的配置。
+type FeishuSpec struct {
+	// URLSecretRef 引用一个包含飞书机器人 Webhook URL 的 Secret。
+	URLSecretRef corev1.SecretKeySelector `json:"urlSecretRef"`
+	// SecretKeySecretRef (可选) 引用一个包含加签密钥的 Secret，用于安全校验。
+	// +optional
+	SecretKeySecretRef *corev1.SecretKeySelector `json:"secretKeySecretRef,omitempty"`
 }
 
 // AlertStatus defines the observed state of Alert.

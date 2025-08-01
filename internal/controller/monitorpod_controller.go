@@ -20,12 +20,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-logr/logr"
 	"net/http"
 	"reflect"
 	"regexp"
+	"strings"
 	"sync"
 	"text/template"
 	"time"
@@ -364,6 +369,21 @@ func (m *MonitorManager) streamPodLogs(ctx context.Context, mp *smartlogv1alpha1
 	}
 }
 
+func sanitizeForKubernetes(name string) string {
+	// 转换为小写
+	sanitized := strings.ToLower(name)
+	// 将所有不符合 RFC 1123 规范的字符替换为 -
+	reg := regexp.MustCompile("[^a-z0-9-]+")
+	sanitized = reg.ReplaceAllString(sanitized, "-")
+	// 去除开头和结尾的 -
+	sanitized = strings.Trim(sanitized, "-")
+	// 确保长度不超过63个字符 (Kubernetes 标签的长度限制)
+	if len(sanitized) > 63 {
+		sanitized = sanitized[:63]
+	}
+	return sanitized
+}
+
 // dispatchAlert 函数处理告警
 func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1.MonitorPod, pod *corev1.Pod, logLine string, rule smartlogv1alpha1.LogRule, containerName string) {
 	baseLog := logf.FromContext(ctx).WithValues("MonitorPod", mp.Name, "Pod", pod.Name, "Rule", rule.Name)
@@ -410,60 +430,21 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 	for _, alert := range alerts {
 		wg.Add(1)
 		go func(alertConf smartlogv1alpha1.Alert) {
-			// ... (发送告警的 goroutine 内部逻辑不变) ...
 			defer wg.Done()
 			alertLog := baseLog.WithValues("alert", alertConf.Name)
-			templateStr := mp.Spec.AlertTemplate
-			if templateStr == "" && alertConf.Spec.Webhook != nil && alertConf.Spec.Webhook.BodyTemplate != "" {
-				alertLog.Info("MonitorPod 模板为空，回退到 Alert 的 bodyTemplate")
-				templateStr = alertConf.Spec.Webhook.BodyTemplate
+
+			// 根据告警类型分发
+			switch alertConf.Spec.Type {
+			case "Webhook":
+				m.sendWebhookAlert(ctx, alertLog, mp, &alertConf, templateData, successCh)
+			case "Feishu":
+				// 飞书使用原始日志，因为它自己的 markdown 会处理
+				feishuTemplateData := templateData
+				feishuTemplateData.LogLine = logLine
+				m.sendFeishuAlert(ctx, alertLog, mp, &alertConf, feishuTemplateData, successCh)
+			default:
+				alertLog.Error(fmt.Errorf("unsupported alert type"), "Unsupported alert type", "type", alertConf.Spec.Type)
 			}
-			messageBody, err := m.renderAlertTemplate(templateStr, templateData)
-			if err != nil {
-				alertLog.Error(err, "渲染告警模板失败")
-				return
-			}
-			alertLog.Info("即将发送到 Webhook 的最终载荷", "payload", string(messageBody))
-			if alertConf.Spec.Webhook == nil {
-				alertLog.Error(fmt.Errorf("webhook spec is nil"), "Webhook 配置缺失")
-				return
-			}
-			var secret corev1.Secret
-			secretKey := types.NamespacedName{Name: alertConf.Spec.Webhook.URLSecretRef.Name, Namespace: alertConf.Namespace}
-			if err := m.Get(ctx, secretKey, &secret); err != nil {
-				alertLog.Error(err, "获取 Webhook 的 Secret 失败", "secretName", secretKey.Name)
-				return
-			}
-			webhookURLBytes, ok := secret.Data[alertConf.Spec.Webhook.URLSecretRef.Key]
-			if !ok {
-				alertLog.Error(fmt.Errorf("key not found in secret"), "在 Secret 中未找到指定的 key", "secretKey", alertConf.Spec.Webhook.URLSecretRef.Key)
-				return
-			}
-			webhookURL := string(webhookURLBytes)
-			reqCtx, cancelReq := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancelReq()
-			req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, webhookURL, bytes.NewBuffer(messageBody))
-			if err != nil {
-				alertLog.Error(err, "创建 HTTP 请求失败")
-				return
-			}
-			req.Header.Set("Content-Type", "application/json")
-			for _, header := range alertConf.Spec.Webhook.Headers {
-				req.Header.Set(header.Name, header.Value)
-			}
-			httpClient := &http.Client{}
-			resp, err := httpClient.Do(req)
-			if err != nil {
-				alertLog.Error(err, "发送 Webhook 通知失败")
-				return
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode >= 400 {
-				alertLog.Error(fmt.Errorf("Webhook 服务端返回错误状态码: %s", resp.Status), "Webhook 发送失败")
-				return
-			}
-			alertLog.Info("成功发送通知")
-			successCh <- true
 		}(alert)
 	}
 
@@ -473,13 +454,14 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 	if len(successCh) > 0 {
 		if mp.Spec.RecordAlerts {
 			baseLog.Info("RecordAlerts 已启用，正在创建 AlertRecord...")
+			sanitizedRuleName := sanitizeForKubernetes(rule.Name)
 			alertRecord := &smartlogv1alpha1.AlertRecord{
 				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: fmt.Sprintf("%s-%s-", mp.Name, rule.Name),
+					GenerateName: fmt.Sprintf("%s-%s-", mp.Name, sanitizedRuleName),
 					Namespace:    mp.Namespace,
 					Labels: map[string]string{
 						"smartlog.smart-tools.com/monitorpod": mp.Name,
-						"smartlog.smart-tools.com/rule":       rule.Name,
+						"smartlog.smart-tools.com/rule":       sanitizedRuleName,
 					},
 				},
 				Spec: smartlogv1alpha1.AlertRecordSpec{
@@ -521,6 +503,224 @@ func (m *MonitorManager) dispatchAlert(ctx context.Context, mp *smartlogv1alpha1
 			baseLog.Info("成功更新 MonitorPod 的告警状态")
 		}
 	}
+}
+
+// getSecretValue 是一个辅助函数，用于从 Secret 中安全地获取值
+func (m *MonitorManager) getSecretValue(ctx context.Context, namespace string, selector *corev1.SecretKeySelector) string {
+	if selector == nil {
+		return ""
+	}
+	var secret corev1.Secret
+	secretKey := types.NamespacedName{Namespace: namespace, Name: selector.Name}
+	if err := m.Get(ctx, secretKey, &secret); err != nil {
+		return ""
+	}
+	if val, ok := secret.Data[selector.Key]; ok {
+		return string(val)
+	}
+	return ""
+}
+
+// sendWebhookAlert 负责发送通用的 Webhook 告警
+func (m *MonitorManager) sendWebhookAlert(ctx context.Context, alertLog logr.Logger, mp *smartlogv1alpha1.MonitorPod, alertConf *smartlogv1alpha1.Alert, templateData TemplateData, successCh chan<- bool) {
+	if alertConf.Spec.Webhook == nil {
+		alertLog.Error(fmt.Errorf("webhook spec is nil"), "Webhook 配置缺失")
+		return
+	}
+
+	templateStr := mp.Spec.AlertTemplate
+	if templateStr == "" {
+		templateStr = alertConf.Spec.Webhook.BodyTemplate
+	}
+
+	messageBody, err := m.renderAlertTemplate(templateStr, templateData)
+	if err != nil {
+		alertLog.Error(err, "渲染告警模板失败")
+		return
+	}
+
+	webhookURL := m.getSecretValue(ctx, alertConf.Namespace, &alertConf.Spec.Webhook.URLSecretRef)
+	if webhookURL == "" {
+		alertLog.Error(fmt.Errorf("webhook url is empty"), "获取 Webhook 的 Secret 失败")
+		return
+	}
+
+	reqCtx, cancelReq := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelReq()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, webhookURL, bytes.NewBuffer(messageBody))
+	if err != nil {
+		alertLog.Error(err, "创建 HTTP 请求失败")
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	for _, header := range alertConf.Spec.Webhook.Headers {
+		req.Header.Set(header.Name, header.Value)
+	}
+
+	httpClient := &http.Client{}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		alertLog.Error(err, "发送 Webhook 通知失败")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		alertLog.Error(fmt.Errorf("Webhook 服务端返回错误状态码: %s", resp.Status), "Webhook 发送失败")
+		return
+	}
+
+	alertLog.Info("成功发送通知")
+	successCh <- true
+}
+
+// genFeishuSign 计算飞书机器人的签名
+func genFeishuSign(secret string, timestamp int64) (string, error) {
+	stringToSign := fmt.Sprintf("%v\n%s", timestamp, secret)
+	var data []byte
+	h := hmac.New(sha256.New, []byte(stringToSign))
+	_, err := h.Write(data)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(h.Sum(nil)), nil
+}
+
+// sendFeishuAlert 负责发送飞书告警
+func (m *MonitorManager) sendFeishuAlert(ctx context.Context, alertLog logr.Logger, mp *smartlogv1alpha1.MonitorPod, alertConf *smartlogv1alpha1.Alert, templateData TemplateData, successCh chan<- bool) {
+	if alertConf.Spec.Feishu == nil {
+		alertLog.Error(fmt.Errorf("feishu spec is nil"), "飞书配置缺失")
+		return
+	}
+
+	webhookURL := m.getSecretValue(ctx, alertConf.Namespace, &alertConf.Spec.Feishu.URLSecretRef)
+	if webhookURL == "" {
+		alertLog.Error(fmt.Errorf("webhook url is empty"), "获取飞书 Webhook 的 Secret 失败")
+		return
+	}
+
+	// 构造飞书消息体 (使用富文本卡片)
+	// 注意：飞书的 lark_md 对 json 转义的 `\` 处理不佳，所以这里使用原始 logLine
+	feishuPayload := map[string]interface{}{
+		"msg_type": "interactive",
+		"card": map[string]interface{}{
+			"config": map[string]bool{"wide_screen_mode": true},
+			"header": map[string]interface{}{
+				"title":    map[string]string{"tag": "plain_text", "content": "🔥 Smart-Log 实时告警"},
+				"template": "red",
+			},
+			"elements": []interface{}{
+				map[string]interface{}{
+					"tag": "div",
+					"fields": []interface{}{
+						map[string]interface{}{
+							"is_short": true,
+							"text": map[string]string{
+								"tag":     "lark_md",
+								"content": fmt.Sprintf("**🔈 通知人员:** %s", "<at id=all></at>"),
+							},
+						},
+						map[string]interface{}{
+							"is_short": true,
+							"text": map[string]string{
+								"tag":     "lark_md",
+								"content": fmt.Sprintf("**📝 告警规则:** **%s**", templateData.RuleName),
+							},
+						},
+						map[string]interface{}{
+							"is_short": true,
+							"text": map[string]string{
+								"tag":     "lark_md",
+								"content": fmt.Sprintf("**📄 监控任务:** **%s**", mp.Name),
+							},
+						},
+						map[string]interface{}{
+							"is_short": true,
+							"text": map[string]string{
+								"tag":     "lark_md",
+								"content": fmt.Sprintf("**📦 Pod:** **%s**", templateData.PodName),
+							},
+						},
+						map[string]interface{}{
+							"is_short": true,
+							"text": map[string]string{
+								"tag":     "lark_md",
+								"content": fmt.Sprintf("**🖥️ 容器:** **%s**", templateData.ContainerName),
+							},
+						},
+						map[string]interface{}{
+							"is_short": false,
+							"text": map[string]string{
+								"tag":     "lark_md",
+								"content": fmt.Sprintf("**🌐 命名空间:** **%s**", templateData.Namespace),
+							},
+						},
+					},
+				},
+				map[string]interface{}{"tag": "hr"},
+				map[string]interface{}{
+					"tag": "div",
+					"text": map[string]string{
+						"tag":     "lark_md",
+						"content": fmt.Sprintf("**📑 日志内容:** \n\n<font color='red'>%s</font>\n", templateData.LogLine),
+					},
+				},
+				map[string]interface{}{"tag": "hr"},
+				map[string]interface{}{
+					"tag": "note",
+					"elements": []interface{}{
+						map[string]string{
+							"tag":     "plain_text",
+							"content": "触发于: " + templateData.Timestamp.Format("2006-01-02 15:04:05"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// 处理加签
+	if alertConf.Spec.Feishu.SecretKeySecretRef != nil {
+		secretKey := m.getSecretValue(ctx, alertConf.Namespace, alertConf.Spec.Feishu.SecretKeySecretRef)
+		if secretKey != "" {
+			timestamp := time.Now().Unix()
+			sign, err := genFeishuSign(secretKey, timestamp)
+			if err != nil {
+				alertLog.Error(err, "生成飞书签名失败")
+			} else {
+				// 飞书的签名信息需要放在 body 里
+				feishuPayload["timestamp"] = timestamp
+				feishuPayload["sign"] = sign
+			}
+		}
+	}
+
+	payloadBytes, _ := json.Marshal(feishuPayload)
+	reqCtx, cancelReq := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelReq()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, webhookURL, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		alertLog.Error(err, "创建 HTTP 请求失败")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	httpClient := &http.Client{}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		alertLog.Error(err, "发送飞书通知失败")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		alertLog.Error(fmt.Errorf("飞书服务端返回错误状态码: %s", resp.Status), "飞书发送失败")
+		return
+	}
+
+	alertLog.Info("成功发送飞书通知")
+	successCh <- true
 }
 
 // getAlertsFromTarget 获取指定目标下的所有已就绪的告警
