@@ -4,25 +4,23 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.18.0
-  name: alerts.smartlog.smart-tools.com
+  name: aiproviders.smartlog.smart-tools.com
 spec:
   group: smartlog.smart-tools.com
   names:
-    kind: Alert
-    listKind: AlertList
-    plural: alerts
+    kind: AIProvider
+    listKind: AIProviderList
+    plural: aiproviders
     shortNames:
-    - alt
-    singular: alert
+    - aip
+    singular: aiprovider
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - description: 表示该告警渠道是否就绪
-      jsonPath: .status.conditions[?(@.type=='Ready')].status
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
       name: Ready
       type: string
-    - description: 告警渠道的类型
-      jsonPath: .spec.type
+    - jsonPath: .spec.type
       name: Type
       type: string
     - jsonPath: .metadata.creationTimestamp
@@ -31,7 +29,7 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Alert is the Schema for the alerts API
+        description: AIProvider is the Schema for the aiproviders API
         properties:
           apiVersion:
             description: |-
@@ -51,13 +49,13 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of Alert
+            description: spec defines the desired state of AIProvider
             properties:
-              feishu:
-                description: Feishu 的详细配置, 仅当 Type 为 "Feishu" 时有效。
+              gemini:
+                description: Gemini 定义了连接到 Google Gemini API 的配置。
                 properties:
-                  secretKeySecretRef:
-                    description: SecretKeySecretRef (可选) 引用一个包含加签密钥的 Secret，用于安全校验。
+                  apiKeySecretRef:
+                    description: APIKeySecretRef 引用一个包含 Gemini API Key 的 Secret。
                     properties:
                       key:
                         description: The key of the secret to select from.  Must be
@@ -80,8 +78,20 @@ spec:
                     - key
                     type: object
                     x-kubernetes-map-type: atomic
-                  urlSecretRef:
-                    description: URLSecretRef 引用一个包含飞书机器人 Webhook URL 的 Secret。
+                  baseURL:
+                    description: BaseURL (可选) 用于指定一个自定义的 Gemini API 端点地址，用于代理等场景。
+                    type: string
+                  model:
+                    description: Model (可选) 指定要使用的具体模型，默认为 "gemini-pro"。
+                    type: string
+                required:
+                - apiKeySecretRef
+                type: object
+              openAI:
+                description: OpenAI 定义了连接到 OpenAI API 的配置。
+                properties:
+                  apiKeySecretRef:
+                    description: APIKeySecretRef 引用一个包含 OpenAI API Key 的 Secret。
                     properties:
                       key:
                         description: The key of the secret to select from.  Must be
@@ -104,70 +114,29 @@ spec:
                     - key
                     type: object
                     x-kubernetes-map-type: atomic
+                  baseURL:
+                    description: BaseURL (可选) 用于指定一个自定义的 OpenAI API 端点地址，用于代理等场景。
+                    type: string
+                  model:
+                    description: Model (可选) 指定要使用的具体模型，默认为 "gpt-3.5-turbo"。
+                    type: string
+                required:
+                - apiKeySecretRef
                 type: object
               type:
-                description: Type 指定了告警渠道的类型。
+                description: Type 指定了 AI 提供商的类型。
                 enum:
-                - Webhook
-                - Feishu
+                - Gemini
+                - OpenAI
                 type: string
-              webhook:
-                description: Webhook 的详细配置, 仅当 Type 为 "Webhook" 时有效。
-                properties:
-                  bodyTemplate:
-                    description: BodyTemplate (可选) 告警内容的 Go 模板, 作为渠道的默认格式。
-                    type: string
-                  headers:
-                    description: Headers (可选) 发送到 Webhook 的自定义 HTTP 请求头。
-                    items:
-                      description: WebhookHeader 定义了要发送的自定义 HTTP 请求头。
-                      properties:
-                        name:
-                          type: string
-                        value:
-                          type: string
-                      required:
-                      - name
-                      - value
-                      type: object
-                    type: array
-                  urlSecretRef:
-                    description: URLSecretRef 引用一个包含 Webhook URL 的 Secret。
-                    properties:
-                      key:
-                        description: The key of the secret to select from.  Must be
-                          a valid secret key.
-                        type: string
-                      name:
-                        default: ""
-                        description: |-
-                          Name of the referent.
-                          This field is effectively required, but due to backwards compatibility is
-                          allowed to be empty. Instances of this type with an empty value here are
-                          almost certainly wrong.
-                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                        type: string
-                      optional:
-                        description: Specify whether the Secret or its key must be
-                          defined
-                        type: boolean
-                    required:
-                    - key
-                    type: object
-                    x-kubernetes-map-type: atomic
-                required:
-                - urlSecretRef
-                type: object
             required:
             - type
             type: object
           status:
-            description: status defines the observed state of Alert
+            description: status defines the observed state of AIProvider
             properties:
               conditions:
-                description: |-
-                  Conditions 存储了资源的详细状态列表，例如 Ready 状态。
-                  这是表达资源状态的标准方式。
+                description: Conditions 存储了资源的详细状态列表，例如 Ready 状态。
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

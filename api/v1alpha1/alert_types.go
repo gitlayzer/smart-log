@@ -21,7 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// AlertSpec defines the desired state of Alert
+// AlertSpec 定义了告警渠道的配置。
 type AlertSpec struct {
 	// Type 指定了告警渠道的类型。
 	// +kubebuilder:validation:Enum=Webhook;Feishu
@@ -57,6 +57,7 @@ type WebhookHeader struct {
 // FeishuSpec 定义了发送到飞书机器人所需的配置。
 type FeishuSpec struct {
 	// URLSecretRef 引用一个包含飞书机器人 Webhook URL 的 Secret。
+	// +optional
 	URLSecretRef corev1.SecretKeySelector `json:"urlSecretRef"`
 	// SecretKeySecretRef (可选) 引用一个包含加签密钥的 Secret，用于安全校验。
 	// +optional

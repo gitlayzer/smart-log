@@ -6,6 +6,7 @@ resources:
 - bases/smartlog.smart-tools.com_alertgroups.yaml
 - bases/smartlog.smart-tools.com_monitorpods.yaml
 - bases/smartlog.smart-tools.com_alertrecords.yaml
+- bases/smartlog.smart-tools.com_aiproviders.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

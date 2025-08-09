@@ -23,6 +23,7 @@ rules:
 - apiGroups:
   - smartlog.smart-tools.com
   resources:
+  - aiproviders
   - alertgroups
   - alerts
   - monitorpods
@@ -37,6 +38,7 @@ rules:
 - apiGroups:
   - smartlog.smart-tools.com
   resources:
+  - aiproviders/finalizers
   - alertgroups/finalizers
   - alerts/finalizers
   - monitorpods/finalizers
@@ -45,6 +47,7 @@ rules:
 - apiGroups:
   - smartlog.smart-tools.com
   resources:
+  - aiproviders/status
   - alertgroups/status
   - alerts/status
   - monitorpods/status

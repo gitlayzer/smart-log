@@ -61,6 +61,26 @@ spec:
           spec:
             description: spec defines the desired state of MonitorPod
             properties:
+              aiEnrichment:
+                description: AIEnrichment (可选) 用于配置 AI 对告警内容的丰富化处理
+                properties:
+                  enabled:
+                    description: Enabled 用于启用 AI 对告警内容的丰富化处理。
+                    type: boolean
+                  prompt:
+                    description: Prompt 是一个 Go 模板字符串，用于构建发送给大语言模型的提示。
+                    type: string
+                  providerRef:
+                    description: ProviderRef 引用一个 AIProvider 资源。
+                    properties:
+                      name:
+                        description: Name 是 AIProvider 资源的名称。
+                        type: string
+                    type: object
+                  timeout:
+                    description: Timeout 用于设置大语言模型调用的超时时间。
+                    type: string
+                type: object
               alertRecordTTL:
                 description: |-
                   AlertRecordTTL 定义了创建的 AlertRecord 资源的存活时间 (Time-To-Live)。
@@ -79,9 +99,6 @@ spec:
                   name:
                     description: Name 用于指定目标名称
                     type: string
-                required:
-                - kind
-                - name
                 type: object
               alertTemplate:
                 description: AlertTemplate 告警模板
@@ -105,8 +122,6 @@ spec:
                       Pattern 是一个正则表达式，用于标识一个日志行的归属。
                       它通常用于匹配一个新日志事件的起始行。
                     type: string
-                required:
-                - pattern
                 type: object
               rateLimit:
                 description: RateLimit 用于限制发送的告警数量
@@ -117,9 +132,6 @@ spec:
                   period:
                     description: Period 用于指定限制的频率, 例如 "1m" 表示一分钟内最多发送一次
                     type: string
-                required:
-                - limit
-                - period
                 type: object
               recordAlerts:
                 description: |-
@@ -139,9 +151,6 @@ spec:
                     regex:
                       description: Regex 用于匹配日志行
                       type: string
-                  required:
-                  - name
-                  - regex
                   type: object
                 type: array
               selector:
@@ -190,10 +199,6 @@ spec:
                     type: object
                 type: object
                 x-kubernetes-map-type: atomic
-            required:
-            - alertTarget
-            - rules
-            - selector
             type: object
           status:
             description: status defines the observed state of MonitorPod

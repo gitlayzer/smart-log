@@ -157,9 +157,16 @@ func (r *AlertReconciler) findAlertsForSecret(ctx context.Context, secret client
 	}
 	requests := make([]reconcile.Request, 0)
 	for _, alert := range alerts.Items {
-		if (alert.Spec.Webhook != nil && alert.Spec.Webhook.URLSecretRef.Name == secret.GetName()) ||
-			(alert.Spec.Feishu != nil && alert.Spec.Feishu.URLSecretRef.Name == secret.GetName()) ||
-			(alert.Spec.Feishu != nil && alert.Spec.Feishu.SecretKeySecretRef != nil && alert.Spec.Feishu.SecretKeySecretRef.Name == secret.GetName()) {
+		feishuSpec := alert.Spec.Feishu
+		webhookSpec := alert.Spec.Webhook
+
+		// 检查 Webhook 的引用
+		isWebhookRelated := webhookSpec != nil && webhookSpec.URLSecretRef.Name == secret.GetName()
+
+		// 检查 Feishu 的引用（包括所有字段）
+		isFeishuRelated := feishuSpec != nil && (feishuSpec.URLSecretRef.Name == secret.GetName() ||
+			(feishuSpec.SecretKeySecretRef != nil && feishuSpec.SecretKeySecretRef.Name == secret.GetName()))
+		if isWebhookRelated || isFeishuRelated {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      alert.Name,
